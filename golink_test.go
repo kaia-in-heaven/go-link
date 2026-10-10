@@ -4,7 +4,11 @@
 package golink
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,25 +19,39 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/net/xsrftoken"
+	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/must"
 )
 
-func init() {
-	// tests always need golink to be run in dev mode
-	*dev = ":8080"
-}
-
-func TestServeGo(t *testing.T) {
-	var err error
-	db, err = NewSQLiteDB(":memory:")
+// newTestServer returns a golink Server backed by an in-memory database,
+// running in dev mode so that requests are authenticated as a fake user
+// without a LocalAPI client.
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	db, err := NewSQLiteDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Save(&Link{Short: "who", Long: "http://who/"})
-	db.Save(&Link{Short: "me", Long: "/who/{{.User}}"})
-	db.Save(&Link{Short: "invalid-var", Long: "/who/{{.Invalid}}"})
+	s, err := New(Options{DB: db, Dev: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestNewRejectsInvalidOptions(t *testing.T) {
+	if _, err := New(Options{}); err == nil {
+		t.Fatal("New with nil database succeeded")
+	}
+}
+
+func TestServeGo(t *testing.T) {
+	s := newTestServer(t)
+	s.db.Save(&Link{Short: "who", Long: "http://who/"})
+	s.db.Save(&Link{Short: "me", Long: "/who/{{.User}}"})
+	s.db.Save(&Link{Short: "invalid-var", Long: "/who/{{.Invalid}}"})
 
 	tests := []struct {
 		name        string
@@ -131,16 +149,16 @@ func TestServeGo(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.currentUser != nil {
-				oldCurrentUser := currentUser
-				currentUser = tt.currentUser
+				oldCurrentUser := s.currentUser
+				s.currentUser = tt.currentUser
 				t.Cleanup(func() {
-					currentUser = oldCurrentUser
+					s.currentUser = oldCurrentUser
 				})
 			}
 
 			r := httptest.NewRequest("GET", tt.link, nil)
 			w := httptest.NewRecorder()
-			serveHandler().ServeHTTP(w, r)
+			s.Handler().ServeHTTP(w, r)
 
 			if w.Code != tt.wantStatus {
 				t.Errorf("serveGo(%q) = %d; want %d", tt.link, w.Code, tt.wantStatus)
@@ -152,19 +170,32 @@ func TestServeGo(t *testing.T) {
 	}
 }
 
-func TestServeSave(t *testing.T) {
-	var err error
-	db, err = NewSQLiteDB(":memory:")
-	if err != nil {
-		t.Fatal(err)
+func TestReferrerPolicy(t *testing.T) {
+	s := newTestServer(t)
+	s.db.Save(&Link{Short: "who", Long: "http://who/"})
+
+	// all responses should ask the browser to suppress the Referer header,
+	// so that link destinations never learn the golink host.
+	for _, path := range []string{"/", "/who", "/.detail/who"} {
+		r := httptest.NewRequest("GET", path, nil)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+
+		if got := w.Header().Get("Referrer-Policy"); got != "no-referrer" {
+			t.Errorf("GET %q: Referrer-Policy = %q; want %q", path, got, "no-referrer")
+		}
 	}
-	db.Save(&Link{Short: "link-owned-by-tagged-devices", Long: "/before", Owner: "tagged-devices"})
+}
+
+func TestServeSave(t *testing.T) {
+	s := newTestServer(t)
+	s.db.Save(&Link{Short: "link-owned-by-tagged-devices", Long: "/before", Owner: "tagged-devices"})
 
 	fooXSRF := func(short string) string {
-		return xsrftoken.Generate(xsrfKey, "foo@example.com", short)
+		return xsrftoken.Generate(s.xsrfKey, "foo@example.com", short)
 	}
 	barXSRF := func(short string) string {
-		return xsrftoken.Generate(xsrfKey, "bar@example.com", short)
+		return xsrftoken.Generate(s.xsrfKey, "bar@example.com", short)
 	}
 
 	tests := []struct {
@@ -257,16 +288,16 @@ func TestServeSave(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.currentUser != nil {
-				oldCurrentUser := currentUser
-				currentUser = tt.currentUser
+				oldCurrentUser := s.currentUser
+				s.currentUser = tt.currentUser
 				t.Cleanup(func() {
-					currentUser = oldCurrentUser
+					s.currentUser = oldCurrentUser
 				})
 			}
 
-			oldAllowUnknownUsers := *allowUnknownUsers
-			*allowUnknownUsers = tt.allowUnknownUsers
-			t.Cleanup(func() { *allowUnknownUsers = oldAllowUnknownUsers })
+			oldAllowUnknownUsers := s.allowUnknownUsers
+			s.allowUnknownUsers = tt.allowUnknownUsers
+			t.Cleanup(func() { s.allowUnknownUsers = oldAllowUnknownUsers })
 
 			r := httptest.NewRequest("POST", "/", strings.NewReader(url.Values{
 				"short": {tt.short},
@@ -275,7 +306,7 @@ func TestServeSave(t *testing.T) {
 			}.Encode()))
 			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			w := httptest.NewRecorder()
-			serveSave(w, r)
+			s.serveSave(w, r)
 
 			if w.Code != tt.wantStatus {
 				t.Errorf("serveSave(%q, %q) = %d; want %d", tt.short, tt.long, w.Code, tt.wantStatus)
@@ -290,17 +321,13 @@ func TestServeSave(t *testing.T) {
 }
 
 func TestServeDelete(t *testing.T) {
-	var err error
-	db, err = NewSQLiteDB(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.Save(&Link{Short: "a", Owner: "a@example.com"})
-	db.Save(&Link{Short: "foo", Owner: "foo@example.com"})
-	db.Save(&Link{Short: "link-owned-by-tagged-devices", Long: "/before", Owner: "tagged-devices"})
+	s := newTestServer(t)
+	s.db.Save(&Link{Short: "a", Owner: "a@example.com"})
+	s.db.Save(&Link{Short: "foo", Owner: "foo@example.com"})
+	s.db.Save(&Link{Short: "link-owned-by-tagged-devices", Long: "/before", Owner: "tagged-devices"})
 
 	xsrf := func(short string) string {
-		return xsrftoken.Generate(xsrfKey, "foo@example.com", short)
+		return xsrftoken.Generate(s.xsrfKey, "foo@example.com", short)
 	}
 
 	tests := []struct {
@@ -355,10 +382,10 @@ func TestServeDelete(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.currentUser != nil {
-				oldCurrentUser := currentUser
-				currentUser = tt.currentUser
+				oldCurrentUser := s.currentUser
+				s.currentUser = tt.currentUser
 				t.Cleanup(func() {
-					currentUser = oldCurrentUser
+					s.currentUser = oldCurrentUser
 				})
 			}
 
@@ -367,7 +394,7 @@ func TestServeDelete(t *testing.T) {
 			}.Encode()))
 			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			w := httptest.NewRecorder()
-			serveDelete(w, r)
+			s.serveDelete(w, r)
 			t.Logf("response body: %v", w.Body.String())
 			if w.Code != tt.wantStatus {
 				t.Errorf("serveDelete(%q) = %d; want %d", tt.short, w.Code, tt.wantStatus)
@@ -381,33 +408,29 @@ func TestServeExport(t *testing.T) {
 		Start: time.Date(2022, 06, 02, 1, 2, 3, 4, time.UTC),
 	})
 
-	var err error
-	db, err = NewSQLiteDB(":memory:")
-	db.clock = clock
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.Save(&Link{Short: "a", Owner: "a@example.com"})
-	db.Save(&Link{Short: "foo", Owner: "foo@example.com"})
-	db.Save(&Link{Short: "link-owned-by-tagged-devices", Long: "/before", Owner: "tagged-devices"})
+	s := newTestServer(t)
+	s.db.clock = clock
+	s.db.Save(&Link{Short: "a", Owner: "a@example.com"})
+	s.db.Save(&Link{Short: "foo", Owner: "foo@example.com"})
+	s.db.Save(&Link{Short: "link-owned-by-tagged-devices", Long: "/before", Owner: "tagged-devices"})
 
 	click := func(id string) {
 		r := httptest.NewRequest("GET", "/"+id, nil)
 		w := httptest.NewRecorder()
-		serveHandler().ServeHTTP(w, r)
+		s.Handler().ServeHTTP(w, r)
 	}
-	initStats()
+	s.initStats()
 	click("a")
 	click("foo")
 	click("foo")
-	flushStats()
+	s.FlushStats()
 	clock.Advance(3 * time.Minute)
 	click("a")
 
 	// export links
 	r := httptest.NewRequest("GET", "/.export", nil)
 	w := httptest.NewRecorder()
-	serveHandler().ServeHTTP(w, r)
+	s.Handler().ServeHTTP(w, r)
 
 	if want := http.StatusOK; w.Code != want {
 		t.Errorf("serveExport = %d; want %d", w.Code, want)
@@ -423,7 +446,7 @@ func TestServeExport(t *testing.T) {
 	// export links stats
 	r = httptest.NewRequest("GET", "/.export-stats", nil)
 	w = httptest.NewRecorder()
-	serveHandler().ServeHTTP(w, r)
+	s.Handler().ServeHTTP(w, r)
 
 	if want := http.StatusOK; w.Code != want {
 		t.Errorf("serveExportStats = %d; want %d", w.Code, want)
@@ -438,43 +461,37 @@ a,1654131903,1
 }
 
 func TestReadOnlyMode(t *testing.T) {
-	var err error
-	db, err = NewSQLiteDB(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.Save(&Link{Short: "who", Long: "http://who/"})
+	s := newTestServer(t)
+	s.db.Save(&Link{Short: "who", Long: "http://who/"})
 
-	oldReadOnly := readonly
-	readonly = ptr.To(true)
-	defer func() { readonly = oldReadOnly }()
+	s.readonly = true
 
 	// resolving link should succeed
 	r := httptest.NewRequest("GET", "/who", nil)
 	w := httptest.NewRecorder()
-	serveHandler().ServeHTTP(w, r)
+	s.Handler().ServeHTTP(w, r)
 	if want := http.StatusFound; w.Code != want {
-		t.Errorf("serveHandler() = %d; want %d", w.Code, want)
+		t.Errorf("Handler() = %d; want %d", w.Code, want)
 	}
 	wantLocation := "http://who/"
 	if location := w.Header().Get("Location"); location != wantLocation {
-		t.Errorf("serveHandler() location = %v; want %v", location, wantLocation)
+		t.Errorf("Handler() location = %v; want %v", location, wantLocation)
 	}
 
 	// updating link should fail
 	r = httptest.NewRequest("POST", "/", nil)
 	w = httptest.NewRecorder()
-	serveHandler().ServeHTTP(w, r)
+	s.Handler().ServeHTTP(w, r)
 	if want := http.StatusMethodNotAllowed; w.Code != want {
-		t.Errorf("serveHandler() = %d; want %d", w.Code, want)
+		t.Errorf("Handler() = %d; want %d", w.Code, want)
 	}
 
 	// deleting link should fail
 	r = httptest.NewRequest("POST", "/.delete/who", nil)
 	w = httptest.NewRecorder()
-	serveHandler().ServeHTTP(w, r)
+	s.Handler().ServeHTTP(w, r)
 	if want := http.StatusMethodNotAllowed; w.Code != want {
-		t.Errorf("serveHandler() = %d; want %d", w.Code, want)
+		t.Errorf("Handler() = %d; want %d", w.Code, want)
 	}
 }
 
@@ -652,15 +669,11 @@ func TestExpandLink(t *testing.T) {
 }
 
 func TestResolveLink(t *testing.T) {
-	var err error
-	db, err = NewSQLiteDB(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.Save(&Link{Short: "meet", Long: "https://meet.google.com/lookup/"})
-	db.Save(&Link{Short: "cs", Long: "http://codesearch/{{with .Path}}search?q={{.}}{{end}}"})
-	db.Save(&Link{Short: "m", Long: "http://go/meet"})
-	db.Save(&Link{Short: "chat", Long: "/meet"})
+	s := newTestServer(t)
+	s.db.Save(&Link{Short: "meet", Long: "https://meet.google.com/lookup/"})
+	s.db.Save(&Link{Short: "cs", Long: "http://codesearch/{{with .Path}}search?q={{.}}{{end}}"})
+	s.db.Save(&Link{Short: "m", Long: "http://go/meet"})
+	s.db.Save(&Link{Short: "chat", Long: "/meet"})
 
 	tests := []struct {
 		link string
@@ -710,7 +723,7 @@ func TestResolveLink(t *testing.T) {
 		name := "golink " + tt.link
 		t.Run(name, func(t *testing.T) {
 			u := must.Get(url.Parse(tt.link))
-			got, err := resolveLink(u)
+			got, err := s.resolveLink(u)
 			if err != nil {
 				t.Error(err)
 			}
@@ -722,12 +735,8 @@ func TestResolveLink(t *testing.T) {
 }
 
 func TestNoHSTSShortDomain(t *testing.T) {
-	var err error
-	db, err = NewSQLiteDB(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.Save(&Link{Short: "foobar", Long: "http://foobar/"})
+	s := newTestServer(t)
+	s.db.Save(&Link{Short: "foobar", Long: "http://foobar/"})
 
 	tests := []struct {
 		host       string
@@ -749,7 +758,7 @@ func TestNoHSTSShortDomain(t *testing.T) {
 			r.Header.Add("Host", tt.host)
 
 			w := httptest.NewRecorder()
-			HSTS(serveHandler()).ServeHTTP(w, r)
+			HSTS(s.Handler()).ServeHTTP(w, r)
 
 			_, found := w.Header()["Strict-Transport-Security"]
 			if found != tt.expectHsts {
@@ -760,7 +769,7 @@ func TestNoHSTSShortDomain(t *testing.T) {
 }
 
 func TestHTTPSRedirectHandlerWithQuery(t *testing.T) {
-	h := redirectHandler("foobar.com")
+	h := RedirectHandler("foobar.com")
 	r := httptest.NewRequest("GET", "http://example.com/?query=bar", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
@@ -773,11 +782,7 @@ func TestHTTPSRedirectHandlerWithQuery(t *testing.T) {
 }
 
 func TestServeSearch(t *testing.T) {
-	var err error
-	db, err = NewSQLiteDB(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := newTestServer(t)
 	links := []*Link{
 		{Short: "alpha", Long: "http://alpha/", Owner: "foo@example.com"},
 		{Short: "beta", Long: "http://beta/", Owner: "foo@example.com"},
@@ -785,7 +790,7 @@ func TestServeSearch(t *testing.T) {
 		{Short: "delta", Long: "http://delta/", Owner: "FOO@example.com"},
 	}
 	for _, link := range links {
-		if err := db.Save(link); err != nil {
+		if err := s.db.Save(link); err != nil {
 			t.Error(err)
 		}
 	}
@@ -824,7 +829,7 @@ func TestServeSearch(t *testing.T) {
 			testURL := "/.search?q=owner:" + url.QueryEscape(tt.owner)
 			r := httptest.NewRequest("GET", testURL, nil)
 			w := httptest.NewRecorder()
-			serveHandler().ServeHTTP(w, r)
+			s.Handler().ServeHTTP(w, r)
 
 			if w.Code != tt.wantStatus {
 				t.Errorf("serveSearch(owner=%q) = %d; want %d", tt.owner, w.Code, tt.wantStatus)
@@ -842,6 +847,40 @@ func TestServeSearch(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSearchResults(t *testing.T) {
+	s := newTestServer(t)
+	s.stats.mu.Lock()
+	s.stats.clicks = ClickStats{"alpha": 3, "beta": 10}
+	s.stats.mu.Unlock()
+
+	links := []*Link{
+		{Short: "alpha"},
+		{Short: "beta"},
+		{Short: "gamma"}, // no recorded clicks; should annotate to 0
+	}
+
+	// Expect the historical alphabetical ordering by short name, with each
+	// link annotated with its current click count.
+	want := []struct {
+		Short     string
+		NumClicks int
+	}{
+		{Short: "alpha", NumClicks: 3},
+		{Short: "beta", NumClicks: 10},
+		{Short: "gamma", NumClicks: 0},
+	}
+
+	got := s.searchResults(links)
+	if len(got) != len(want) {
+		t.Fatalf("searchResults returned %d results; want %d", len(got), len(want))
+	}
+	for i, w := range want {
+		if got[i].Short != w.Short || got[i].NumClicks != w.NumClicks {
+			t.Errorf("result[%d] = {%q, %d}; want {%q, %d}", i, got[i].Short, got[i].NumClicks, w.Short, w.NumClicks)
+		}
 	}
 }
 
@@ -899,5 +938,231 @@ func TestParseAdvertiseTags(t *testing.T) {
 				t.Errorf("parseAdvertiseTags(%q) diff (-want +got):\n%s", tt.input, cmp.Diff(tt.want, got))
 			}
 		})
+	}
+}
+
+func TestTrustIdentityHeaders(t *testing.T) {
+	tests := []struct {
+		name        string
+		serviceName string // value for the server's ServiceName
+		remoteAddr  string
+		want        bool
+	}{
+		{
+			name:        "no service node, loopback",
+			serviceName: "",
+			remoteAddr:  "127.0.0.1:1234",
+			want:        false,
+		},
+		{
+			name:        "service mode, loopback",
+			serviceName: "svc:golink",
+			remoteAddr:  "127.0.0.1:1234",
+			want:        true,
+		},
+		{
+			name:        "service mode, non-loopback",
+			serviceName: "svc:golink",
+			remoteAddr:  "100.64.1.1:1234",
+			want:        false,
+		},
+		{
+			name:        "service mode, IPV6 loopback",
+			serviceName: "svc:golink",
+			remoteAddr:  "[::1]:1234",
+			want:        true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestServer(t)
+			s.serviceName = tt.serviceName
+			r := httptest.NewRequest("GET", "/", nil)
+			r.RemoteAddr = tt.remoteAddr
+			if got := s.trustIdentityHeaders(r); got != tt.want {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractUserFromHeaders(t *testing.T) {
+	adminCapMap := tailcfg.PeerCapMap{
+		peerCapName: []tailcfg.RawMessage{
+			tailcfg.RawMessage(must.Get(json.Marshal(capabilities{Admin: true}))),
+		},
+	}
+	noCapMap := tailcfg.PeerCapMap{}
+
+	tests := []struct {
+		name      string
+		headers   map[string]string
+		whoisFunc func(context.Context, string) (*apitype.WhoIsResponse, error) // mock for LocalClient WhoIs
+		wantLogin string
+		wantAdmin bool
+	}{
+		{
+			name:      "no headers",
+			headers:   nil,
+			wantLogin: "",
+		},
+		{
+			name:      "login header only, no XFF",
+			headers:   map[string]string{"Tailscale-User-Login": "alice@example.com"},
+			wantLogin: "alice@example.com",
+			wantAdmin: false,
+		},
+		{
+			name: "login header with XFF, peer has admin cap",
+			headers: map[string]string{
+				"Tailscale-User-Login": "alice@example.com",
+				"X-Forwarded-For":      "100.64.1.1",
+			},
+			whoisFunc: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{CapMap: adminCapMap}, nil
+			},
+			wantLogin: "alice@example.com",
+			wantAdmin: true,
+		},
+		{
+			name: "login header with XFF, peer has no admin cap",
+			headers: map[string]string{
+				"Tailscale-User-Login": "alice@example.com",
+				"X-Forwarded-For":      "100.64.1.1",
+			},
+			whoisFunc: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{CapMap: noCapMap}, nil
+			},
+			wantLogin: "alice@example.com",
+			wantAdmin: false,
+		},
+		{
+			name: "login header with XFF, WhoIs fails",
+			headers: map[string]string{
+				"Tailscale-User-Login": "alice@example.com",
+				"X-Forwarded-For":      "100.64.1.1",
+			},
+			whoisFunc: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return nil, errors.New("peer not found")
+			},
+			wantLogin: "alice@example.com",
+			wantAdmin: false,
+		},
+		{
+			name: "Invalid X-Forwarded-For header",
+			headers: map[string]string{
+				"Tailscale-User-Login": "alice@example.com",
+				"X-Forwarded-For":      "invalid-ip",
+			},
+			whoisFunc: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{CapMap: adminCapMap}, nil
+			},
+			wantLogin: "alice@example.com",
+			wantAdmin: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestServer(t)
+			if tt.whoisFunc != nil {
+				s.whoisFunc = tt.whoisFunc
+			}
+
+			r := httptest.NewRequest("GET", "/", nil)
+			for k, v := range tt.headers {
+				r.Header.Set(k, v)
+			}
+			got := s.extractUserFromHeaders(r)
+			if got.login != tt.wantLogin {
+				t.Errorf("login: got %q, want %q", got.login, tt.wantLogin)
+			}
+			if got.isAdmin != tt.wantAdmin {
+				t.Errorf("isAdmin: got %v, want %v", got.isAdmin, tt.wantAdmin)
+			}
+		})
+	}
+}
+
+// TestServeHTTPDrainsInFlightOnCancel checks that canceling ctx lets
+// in-flight requests finish before serveHTTP returns.
+func TestServeHTTPDrainsInFlightOnCancel(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+	})}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan error, 1)
+	go func() { served <- serveHTTP(ctx, listenerServer{srv: srv, ln: ln}) }()
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	respCh := make(chan result, 1)
+	go func() {
+		resp, err := http.Get(fmt.Sprintf("http://%s/", ln.Addr()))
+		respCh <- result{resp, err}
+	}()
+
+	<-entered
+	cancel()
+	select {
+	case err := <-served:
+		t.Fatalf("serveHTTP returned %v while a request was in flight", err)
+	default:
+	}
+	close(release)
+
+	select {
+	case res := <-respCh:
+		if res.err != nil {
+			t.Fatalf("in-flight request failed: %v", res.err)
+		}
+		res.resp.Body.Close()
+		if res.resp.StatusCode != http.StatusOK {
+			t.Errorf("in-flight request status = %d; want %d", res.resp.StatusCode, http.StatusOK)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight request did not finish")
+	}
+
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("serveHTTP returned %v; want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveHTTP did not return after ctx was canceled")
+	}
+}
+
+func TestServeHTTPReturnsServeError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	served := make(chan error, 1)
+	go func() {
+		served <- serveHTTP(context.Background(), listenerServer{srv: &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})}, ln: ln})
+	}()
+
+	ln.Close()
+
+	select {
+	case err := <-served:
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("serveHTTP returned %v; want a serve error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveHTTP did not return after the listener closed")
 	}
 }

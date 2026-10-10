@@ -30,6 +30,17 @@ To rebuild the CSS after editing `src/input.css`:
 
     npm run build:css
 
+## How Tailscale uses golink
+
+We use golink at Tailscale every day by every part of the company.
+It is easily one of the most used services on our corporate tailnet.
+We even had to change our new hire onboarding to have employees join our tailnet sooner,
+since much of the rest of our onboarding involved visiting various go links.
+
+Our production environment is pretty plain; we just run it on a pretty vanilla EC2 VM.
+We [back up](#backups) all of our go links once a week from a GitHub Action that stores the snapshot in our internal git monorepo.
+That repo has a wrapper script around `golink --resolve-from-backup` so that anyone with a local copy of the repo can always resolve go links offline.
+
 ## Building and running
 
 To build from source and run in dev mode:
@@ -74,6 +85,50 @@ As long as this is on a persistent volume, the auth key only needs to be provide
 [auth key]: https://tailscale.com/kb/1085/auth-keys/
 [tag]: https://tailscale.com/kb/1068/acl-tags/
 [os.UserConfigDir]: https://pkg.go.dev/os#UserConfigDir
+
+## Registering as a Tailscale Service
+
+By default, golink registers as a regular tailnet node. However, you can register it as a [Tailscale Service],
+which provides more stable identity and is especially useful for ephemeral infrastructure (like fly.io)
+where storage may be lost.
+
+To register as a service:
+
+```bash
+TS_AUTHKEY="tskey-auth-<key>" go run ./cmd/golink -sqlitedb golink.db --register-as-service=svc:golink
+```
+
+Or using the environment variable:
+
+```bash
+TS_SERVICE_NAME="svc:golink" TS_AUTHKEY="tskey-auth-<key>" go run ./cmd/golink -sqlitedb golink.db
+```
+
+**Requirements:**
+- The node must be tagged (e.g., `tag:golink`)
+- Your ACL policy must define the service and include auto-approvers
+- Services only support HTTPS on port 443
+
+**Admin Capabilities in Service Mode:**
+
+Admin capability grants work in service mode by looking up the user's capabilities via the Tailscale daemon whois API. This means admin permissions are properly enforced based on your ACL policy, just like in regular mode.
+
+Example ACL configuration:
+
+```json
+{
+  "tagOwners": {
+    "tag:golink": ["autogroup:admin"]
+  },
+  "autoApprovers": {
+    "services": {
+      "svc:golink": ["tag:golink"]
+    }
+  }
+}
+```
+
+[Tailscale Service]: https://tailscale.com/kb/1534/services/
 
 ## Docker Compose
 
@@ -271,7 +326,7 @@ you could assign the grant to `autogroup:member`:
 
 ## Backups
 
-Once you have golink running, you can backup all of your links in [JSON lines] format from <http://go/.export>.
+Once you have golink running, you can back up all of your links in [JSON lines] format from <http://go/.export>.
 At Tailscale, we snapshot our links weekly and store them in git.
 
 To restore links, specify the snapshot file on startup.
