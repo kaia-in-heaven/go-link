@@ -324,6 +324,63 @@ you could assign the grant to `autogroup:member`:
 
 [ACL grants]: https://tailscale.com/kb/1324/acl-grants
 
+## Updating this fork
+
+### 1. Pull in upstream changes (on your development machine)
+
+Do this on a branch so `main` stays safe until you've checked the result:
+
+    git remote add upstream https://github.com/tailscale/golink.git   # first time only
+    git fetch upstream
+    git switch -c merge-upstream
+    git merge upstream/main
+
+Resolve any conflicts, keeping the `ctp-*` Catppuccin classes in `tmpl/*.html`.
+If upstream adds new markup, restyle it with `ctp-*` classes.
+Keep this fork's `yarn.lock`, `package.json`, `src/input.css` and `static/base.css`.
+If you add new Tailwind classes to a template, rebuild the CSS with `npm run build:css`.
+
+Then check it builds and passes tests, and merge into `main`:
+
+    go build ./... && go vet ./... && go test ./...
+    git switch main && git merge --ff-only merge-upstream
+    git push origin main
+
+### 2. Deploy to the Docker host (e.g. a Raspberry Pi)
+
+The upstream image (`ghcr.io/tailscale/golink`) does not include this fork's theme,
+so build the image from this repo instead. The compiled CSS is committed, so Node isn't needed.
+
+On the host, back up your links and rebuild:
+
+    curl -L http://go/.export -o links-backup.json
+    cd go-link && git pull
+    docker build -t golink-custom:local .
+
+Then recreate the container on the new image. With Docker Compose:
+
+    docker compose up -d
+
+Or without Compose:
+
+    docker stop golink && docker rm golink
+    docker run -d --name golink --restart unless-stopped \
+      -v golink_data:/home/nonroot golink-custom:local
+
+Links and the Tailscale login live in the `golink_data` volume, which survives rebuilds.
+Do not run `docker rm -v`, `docker compose down -v` or `docker volume rm golink_data`, as these delete your links.
+
+### 3. Check what's running
+
+golink has no `--version` flag, so check indirectly:
+
+    docker ps --filter name=golink --format '{{.Image}}  {{.CreatedAt}}'
+    docker image inspect golink-custom:local --format '{{.Created}}'
+
+If the image is older than your last merge, rebuild it.
+In the browser, the Catppuccin theme and the Clicks column on the search page
+(`http://go/.all`) confirm you're running this fork with the upstream changes.
+
 ## Backups
 
 Once you have golink running, you can back up all of your links in [JSON lines] format from <http://go/.export>.
